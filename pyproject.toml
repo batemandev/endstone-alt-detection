@@ -1,0 +1,11 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "endstone-alt-detection"
+version = "1.0.0"
+description = "Alt Detection System for Endstone Servers. Written by @batemandev"
+
+[project.entry-points."endstone"]
+alt-detection = "endstone_alt_detection:AltDetection"
