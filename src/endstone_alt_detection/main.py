@@ -520,6 +520,7 @@ class AltDetection(Plugin):
         if direct_matches:
             direct_count = len(direct_matches)
             account_word = "account" if direct_count == 1 else "accounts"
+            sender.send_message(f" ")
             sender.send_message(f"§aFound {direct_count} {account_word} with matching IPs:")
             for alt in direct_matches:
                 online_status = "§aStatus: §hOnline" if alt['is_online'] else "§cStatus: §hOffline"
