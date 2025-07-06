@@ -7,6 +7,7 @@ from endstone.plugin import Plugin
 from endstone.event import event_handler, PlayerLoginEvent, PlayerQuitEvent
 from endstone.command import Command, CommandSender
 
+
 class AltDetection(Plugin):
     api_version = "0.5"
     commands = {
@@ -99,14 +100,13 @@ class AltDetection(Plugin):
             self.logger.error(f"Failed to save mappings: {e}")
 
     def find_player_by_name(self, search_name: str) -> str:
-        """Find a player by name (case-insensitive), return the actual stored name"""
         players = self.load_players()
         search_name_lower = search_name.lower()
-        
+
         for player_name in players.keys():
             if player_name.lower() == search_name_lower:
                 return player_name
-        
+
         return None
 
     def format_time_ago(self, timestamp_str: str) -> str:
@@ -164,7 +164,6 @@ class AltDetection(Plugin):
         return None
 
     def get_online_operators(self) -> list:
-        """Get all online operators"""
         operators = []
         for player in self.server.online_players:
             if player.is_op:
@@ -172,7 +171,6 @@ class AltDetection(Plugin):
         return operators
 
     def send_toast_to_operators(self, title: str, content: str) -> None:
-        """Send toast notification to all online operators"""
         operators = self.get_online_operators()
         for operator in operators:
             try:
@@ -182,15 +180,14 @@ class AltDetection(Plugin):
                 self.logger.error(f"Failed to send toast to operator {operator.name}: {e}")
 
     def check_for_alt_on_join(self, player_name: str) -> dict:
-        """Check if a joining player is a potential alt account"""
         result = self.find_alts_by_player(player_name)
-        
+
         if not result["found"]:
             return {"is_alt": False, "related_count": 0}
-        
+
         related_players = result["related_players"]
         direct_matches = [alt for alt in related_players if alt.get("connection_type") == "direct"]
-        
+
         return {
             "is_alt": len(direct_matches) > 0,
             "related_count": len(direct_matches),
@@ -218,10 +215,9 @@ class AltDetection(Plugin):
         self.save_mappings(mappings)
 
     def update_last_seen(self, player_name: str) -> None:
-        """Update the last_seen timestamp for a player"""
         players = self.load_players()
         current_time = datetime.now().isoformat()
-        
+
         if player_name in players:
             players[player_name]["last_seen"] = current_time
             self.save_players(players)
@@ -443,7 +439,12 @@ class AltDetection(Plugin):
                 sender.send_message(f"§eOnline players: {', '.join(online_players)}")
             return False
 
-        target = args[0]
+        target = " ".join(args)
+
+        if target.startswith('"') and target.endswith('"'):
+            target = target[1:-1]
+        elif target.startswith("'") and target.endswith("'"):
+            target = target[1:-1]
 
         if self.is_ip_address(target):
             self.check_by_ip(sender, target)
@@ -478,88 +479,88 @@ class AltDetection(Plugin):
             sender.send_message(f"  §aLast login: §h{self.format_time_ago(player['last_seen'])}")
             sender.send_message(f" ")
 
-def check_by_player(self, sender: CommandSender, player_name: str) -> None:
-    result = self.find_alts_by_player(player_name)
+    def check_by_player(self, sender: CommandSender, player_name: str) -> None:
+        result = self.find_alts_by_player(player_name)
 
-    if not result["found"]:
-        sender.send_message(result["message"])
-        return
+        if not result["found"]:
+            sender.send_message(result["message"])
+            return
 
-    target = result["target_player"]
-    related = result["related_players"]
-
-    sender.send_message(f" ")
-    sender.send_message(f"§a--- Alt Check Results for {target['name']} ---")
-    online_status = "§aStatus: §hOnline" if target['is_online'] else "§cStatus: §hOffline"
-    sender.send_message(f"{online_status}")
-    sender.send_message(f"§eFirst login: §h{self.format_time_ago(target['first_seen'])}")
-    sender.send_message(f"§aLast login: §h{self.format_time_ago(target['last_seen'])}")
-    sender.send_message(f"§vTotal IPs used: §h{target['total_ips']}")
-    sender.send_message(f"§cTotal devices used: §h{target['total_devices']}")
-
-    if target['xuids']:
-        for xuid_entry in target['xuids']:
-            xuid = xuid_entry["xuid"] if isinstance(xuid_entry, dict) else xuid_entry
-            sender.send_message(f"§9XUID:§h {xuid}")
-            sender.send_message(f" ")
-
-    if target['device_os']:
-        sender.send_message("§cDevice OS:")
-        for device_os_entry in target['device_os']:
-            device_os = device_os_entry["device_os"] if isinstance(device_os_entry, dict) else device_os_entry
-            sender.send_message(f"  §h- {device_os}")
-
-    if not related:
-        sender.send_message("§aNo alternative accounts detected.")
-        return
-
-    direct_matches = [alt for alt in related if alt.get("connection_type") == "direct"]
-    subnet_matches = [alt for alt in related if alt.get("connection_type") == "subnet"]
-
-    if direct_matches:
-        direct_count = len(direct_matches)
-        account_word = "account" if direct_count == 1 else "accounts"
-        sender.send_message(f"§aFound {direct_count} {account_word} with matching IPs:")
-        for alt in direct_matches:
-            online_status = "§aStatus: §hOnline" if alt['is_online'] else "§cStatus: §hOffline"
-            sender.send_message(
-                f"§h- §e{alt['name']} §h(Shared IPs: {alt['shared_ips']}, Shared Devices: {alt['shared_devices']})")
-            sender.send_message(f"  {online_status}")
-            sender.send_message(f"  §eFirst login: §h{self.format_time_ago(alt['first_seen'])}")
-            sender.send_message(f"  §aLast login: §h{self.format_time_ago(alt['last_seen'])}")
-
-            if alt['xuids']:
-                xuid_display = alt['xuids'][0]["xuid"] if isinstance(alt['xuids'][0], dict) else alt['xuids'][0]
-                sender.send_message(f"  §9XUID: §h{xuid_display}")
-
-            if alt['is_online']:
-                online_info = self.get_online_player_info(alt['name'])
-                if online_info:
-                    sender.send_message(f"  §cCurrent Device OS: §h{online_info['device_os']}")
-                    sender.send_message(f" ")
-
-    if subnet_matches:
-        subnet_count = len(subnet_matches)
-        account_word = "account" if subnet_count == 1 else "accounts"
+        target = result["target_player"]
+        related = result["related_players"]
 
         sender.send_message(f" ")
-        sender.send_message(f"§aFound {subnet_count} possible alt {account_word} on same network:")
-        for alt in subnet_matches:
-            online_status = "§aStatus: §hOnline" if alt['is_online'] else "§cStatus: §hOffline"
-            sender.send_message(f"§h- §e{alt['name']} §h(Same subnet)")
-            sender.send_message(f"  {online_status}")
-            sender.send_message(f"  §eFirst login: §h{self.format_time_ago(alt['first_seen'])}")
-            sender.send_message(f"  §aLast login: §h{self.format_time_ago(alt['last_seen'])}")
+        sender.send_message(f"§a--- Alt Check Results for {target['name']} ---")
+        online_status = "§aStatus: §hOnline" if target['is_online'] else "§cStatus: §hOffline"
+        sender.send_message(f"{online_status}")
+        sender.send_message(f"§eFirst login: §h{self.format_time_ago(target['first_seen'])}")
+        sender.send_message(f"§aLast login: §h{self.format_time_ago(target['last_seen'])}")
+        sender.send_message(f"§vTotal IPs used: §h{target['total_ips']}")
+        sender.send_message(f"§cTotal devices used: §h{target['total_devices']}")
 
-            if alt['xuids']:
-                xuid_display = alt['xuids'][0]["xuid"] if isinstance(alt['xuids'][0], dict) else alt['xuids'][0]
-                sender.send_message(f"  §9XUID: §h{xuid_display}")
+        if target['xuids']:
+            for xuid_entry in target['xuids']:
+                xuid = xuid_entry["xuid"] if isinstance(xuid_entry, dict) else xuid_entry
+                sender.send_message(f"§9XUID:§h {xuid}")
+                sender.send_message(f" ")
 
-            if alt['is_online']:
-                online_info = self.get_online_player_info(alt['name'])
-                if online_info:
-                    sender.send_message(f"  §cCurrent Device OS: §h{online_info['device_os']}")
-                    sender.send_message(f" ")
+        if target['device_os']:
+            sender.send_message("§cDevice OS:")
+            for device_os_entry in target['device_os']:
+                device_os = device_os_entry["device_os"] if isinstance(device_os_entry, dict) else device_os_entry
+                sender.send_message(f"  §h- {device_os}")
+
+        if not related:
+            sender.send_message("§aNo alternative accounts detected.")
+            return
+
+        direct_matches = [alt for alt in related if alt.get("connection_type") == "direct"]
+        subnet_matches = [alt for alt in related if alt.get("connection_type") == "subnet"]
+
+        if direct_matches:
+            direct_count = len(direct_matches)
+            account_word = "account" if direct_count == 1 else "accounts"
+            sender.send_message(f"§aFound {direct_count} {account_word} with matching IPs:")
+            for alt in direct_matches:
+                online_status = "§aStatus: §hOnline" if alt['is_online'] else "§cStatus: §hOffline"
+                sender.send_message(
+                    f"§h- §e{alt['name']} §h(Shared IPs: {alt['shared_ips']}, Shared Devices: {alt['shared_devices']})")
+                sender.send_message(f"  {online_status}")
+                sender.send_message(f"  §eFirst login: §h{self.format_time_ago(alt['first_seen'])}")
+                sender.send_message(f"  §aLast login: §h{self.format_time_ago(alt['last_seen'])}")
+
+                if alt['xuids']:
+                    xuid_display = alt['xuids'][0]["xuid"] if isinstance(alt['xuids'][0], dict) else alt['xuids'][0]
+                    sender.send_message(f"  §9XUID: §h{xuid_display}")
+
+                if alt['is_online']:
+                    online_info = self.get_online_player_info(alt['name'])
+                    if online_info:
+                        sender.send_message(f"  §cCurrent Device OS: §h{online_info['device_os']}")
+                        sender.send_message(f" ")
+
+        if subnet_matches:
+            subnet_count = len(subnet_matches)
+            account_word = "account" if subnet_count == 1 else "accounts"
+
+            sender.send_message(f" ")
+            sender.send_message(f"§aFound {subnet_count} possible alt {account_word} on same network:")
+            for alt in subnet_matches:
+                online_status = "§aStatus: §hOnline" if alt['is_online'] else "§cStatus: §hOffline"
+                sender.send_message(f"§h- §e{alt['name']} §h(Same subnet)")
+                sender.send_message(f"  {online_status}")
+                sender.send_message(f"  §eFirst login: §h{self.format_time_ago(alt['first_seen'])}")
+                sender.send_message(f"  §aLast login: §h{self.format_time_ago(alt['last_seen'])}")
+
+                if alt['xuids']:
+                    xuid_display = alt['xuids'][0]["xuid"] if isinstance(alt['xuids'][0], dict) else alt['xuids'][0]
+                    sender.send_message(f"  §9XUID: §h{xuid_display}")
+
+                if alt['is_online']:
+                    online_info = self.get_online_player_info(alt['name'])
+                    if online_info:
+                        sender.send_message(f"  §cCurrent Device OS: §h{online_info['device_os']}")
+                        sender.send_message(f" ")
 
     @event_handler
     def on_player_login(self, event: PlayerLoginEvent) -> None:
@@ -576,22 +577,22 @@ def check_by_player(self, sender: CommandSender, player_name: str) -> None:
         self.log_player_data(player.name, ip_address, xuid, device_id, device_os, game_version, locale, unique_id)
 
         alt_check_result = self.check_for_alt_on_join(player.name)
-        
+
         if alt_check_result["is_alt"]:
             related_count = alt_check_result["related_count"]
             related_names = [alt["name"] for alt in alt_check_result["related_players"]]
-            
+
             toast_title = "§cAlt Detection System"
-            
+
             if related_count == 1:
                 toast_content = f"{player.name} may be an alt of {related_names[0]}"
             else:
                 toast_content = f"{player.name} linked to {related_count} accounts: {', '.join(related_names[:3])}"
                 if related_count > 3:
                     toast_content += f" and {related_count - 3} more"
-            
+
             self.send_toast_to_operators(toast_title, toast_content)
-            
+
             self.logger.info(f"{player.name} is linked to {related_count} accounts")
 
     @event_handler

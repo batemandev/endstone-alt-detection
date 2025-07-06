@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "endstone-alt-detection"
-version = "1.0.0"
+version = "1.0.1"
 description = "Alt Detection System for Endstone Servers. Written by @batemandev"
 
 [project.entry-points."endstone"]
