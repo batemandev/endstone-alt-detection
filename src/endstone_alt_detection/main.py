@@ -1,11 +1,17 @@
 import ipaddress
 import json
+import os
 import re
+import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from endstone.plugin import Plugin
 from endstone.event import event_handler, PlayerLoginEvent, PlayerQuitEvent
 from endstone.command import Command, CommandSender
+
+FLUSH_PERIOD_TICKS = 6000
+SUBNET_MASK = 24
 
 
 class AltDetection(Plugin):
@@ -30,10 +36,19 @@ class AltDetection(Plugin):
 
     def on_enable(self) -> None:
         self.logger.info("System is LIVE!")
-        self.register_events(self)
+        self._lock = threading.Lock()
+        self._players_dirty = False
+        self._mappings_dirty = False
         self.setup_database()
+        self.load_cache()
+        self.build_indexes()
+        self.register_events(self)
+        self._flush_task = self.server.scheduler.run_task(
+            self, self.flush_cache, delay=FLUSH_PERIOD_TICKS, period=FLUSH_PERIOD_TICKS
+        )
 
     def on_disable(self) -> None:
+        self.flush_cache()
         self.logger.info("System has been shut down.")
 
     def setup_database(self) -> None:
@@ -44,8 +59,7 @@ class AltDetection(Plugin):
         self.mappings_file = self.db_dir / "mappings.json"
 
         if not self.players_file.exists():
-            with open(self.players_file, 'w') as f:
-                json.dump({}, f, indent=2)
+            self._atomic_write(self.players_file, {})
             self.logger.info("Created players.json file")
 
         if not self.mappings_file.exists():
@@ -54,60 +68,71 @@ class AltDetection(Plugin):
                 "xuid_to_players": {},
                 "device_to_players": {}
             }
-            with open(self.mappings_file, 'w') as f:
-                json.dump(initial_mappings, f, indent=2)
+            self._atomic_write(self.mappings_file, initial_mappings)
             self.logger.info("Created mappings.json file")
 
-    def load_players(self) -> dict:
+    def load_cache(self) -> None:
+        self._players = self._read_json(self.players_file, {})
+
+        mappings = self._read_json(self.mappings_file, {})
+        mappings.setdefault("ip_to_players", {})
+        mappings.setdefault("xuid_to_players", {})
+        mappings.setdefault("device_to_players", {})
+        self._mappings = mappings
+
+    def _read_json(self, path: Path, default: dict) -> dict:
         try:
-            with open(self.players_file, 'r') as f:
+            with open(path, 'r') as f:
                 return json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
-            self.logger.warning("Could not load players file, returning empty dict")
-            return {}
+            self.logger.warning(f"Could not load {path.name}, using default")
+            return default
 
-    def save_players(self, players: dict) -> None:
+    def _atomic_write(self, path: Path, data: dict) -> None:
+        tmp_path = None
         try:
-            with open(self.players_file, 'w') as f:
-                json.dump(players, f, indent=2)
+            fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+            with os.fdopen(fd, 'w') as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, path)
         except Exception as e:
-            self.logger.error(f"Failed to save players: {e}")
+            self.logger.error(f"Failed to write {path.name}: {e}")
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
-    def load_mappings(self) -> dict:
-        try:
-            with open(self.mappings_file, 'r') as f:
-                mappings = json.load(f)
-                if "ip_to_players" not in mappings:
-                    mappings["ip_to_players"] = {}
-                if "xuid_to_players" not in mappings:
-                    mappings["xuid_to_players"] = {}
-                if "device_to_players" not in mappings:
-                    mappings["device_to_players"] = {}
-                return mappings
-        except (json.JSONDecodeError, FileNotFoundError):
-            self.logger.warning("Could not load mappings file, returning empty structure")
-            return {
-                "ip_to_players": {},
-                "xuid_to_players": {},
-                "device_to_players": {}
-            }
+    def flush_cache(self) -> None:
+        with self._lock:
+            if self._players_dirty:
+                self._atomic_write(self.players_file, self._players)
+                self._players_dirty = False
+            if self._mappings_dirty:
+                self._atomic_write(self.mappings_file, self._mappings)
+                self._mappings_dirty = False
 
-    def save_mappings(self, mappings: dict) -> None:
+    def build_indexes(self) -> None:
+        self._name_index = {}
+        self._subnet_index = {}
+
+        for player_name, info in self._players.items():
+            self._name_index[player_name.lower()] = player_name
+            for ip_entry in info.get("ips", []):
+                ip = ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry
+                self._add_to_subnet_index(player_name, ip)
+
+    def _network_key(self, ip: str, subnet_mask: int = SUBNET_MASK) -> str:
         try:
-            with open(self.mappings_file, 'w') as f:
-                json.dump(mappings, f, indent=2)
-        except Exception as e:
-            self.logger.error(f"Failed to save mappings: {e}")
+            return str(ipaddress.IPv4Network(f"{ip}/{subnet_mask}", strict=False).network_address)
+        except Exception:
+            return None
+
+    def _add_to_subnet_index(self, player_name: str, ip: str) -> None:
+        network = self._network_key(ip)
+        if network is None:
+            return
+        self._subnet_index.setdefault(network, set()).add(player_name)
 
     def find_player_by_name(self, search_name: str) -> str:
-        players = self.load_players()
-        search_name_lower = search_name.lower()
-
-        for player_name in players.keys():
-            if player_name.lower() == search_name_lower:
-                return player_name
-
-        return None
+        return self._name_index.get(search_name.lower())
 
     def format_time_ago(self, timestamp_str: str) -> str:
         try:
@@ -194,105 +219,103 @@ class AltDetection(Plugin):
             "related_players": direct_matches
         }
 
-    def update_mappings(self, player_name: str, ip_address: str, xuid: str, device_id: str) -> None:
-        mappings = self.load_mappings()
+    def _update_mappings_locked(self, player_name: str, ip_address: str, xuid: str, device_id: str) -> None:
+        mappings = self._mappings
 
-        if ip_address not in mappings["ip_to_players"]:
-            mappings["ip_to_players"][ip_address] = []
-        if player_name not in mappings["ip_to_players"][ip_address]:
-            mappings["ip_to_players"][ip_address].append(player_name)
-
-        if xuid not in mappings["xuid_to_players"]:
-            mappings["xuid_to_players"][xuid] = []
-        if player_name not in mappings["xuid_to_players"][xuid]:
-            mappings["xuid_to_players"][xuid].append(player_name)
-
-        if device_id not in mappings["device_to_players"]:
-            mappings["device_to_players"][device_id] = []
-        if player_name not in mappings["device_to_players"][device_id]:
-            mappings["device_to_players"][device_id].append(player_name)
-
-        self.save_mappings(mappings)
+        for bucket_name, value in (
+            ("ip_to_players", ip_address),
+            ("xuid_to_players", xuid),
+            ("device_to_players", device_id),
+        ):
+            bucket = mappings[bucket_name]
+            if value not in bucket:
+                bucket[value] = []
+            if player_name not in bucket[value]:
+                bucket[value].append(player_name)
 
     def update_last_seen(self, player_name: str) -> None:
-        players = self.load_players()
-        current_time = datetime.now().isoformat()
-
-        if player_name in players:
-            players[player_name]["last_seen"] = current_time
-            self.save_players(players)
-            self.logger.info(f"Updated last_seen for {player_name}")
-        else:
-            self.logger.warning(f"Attempted to update last_seen for unknown player: {player_name}")
+        with self._lock:
+            if player_name in self._players:
+                self._players[player_name]["last_seen"] = datetime.now().isoformat()
+                self._players_dirty = True
+                self.logger.info(f"Updated last_seen for {player_name}")
+            else:
+                self.logger.warning(f"Attempted to update last_seen for unknown player: {player_name}")
 
     def log_player_data(self, player_name: str, ip_address: str, xuid: str, device_id: str, device_os: str,
                         game_version: str, locale: str, unique_id: str) -> None:
-        players = self.load_players()
         current_time = datetime.now().isoformat()
 
-        if player_name not in players:
-            players[player_name] = {
-                "ips": [],
-                "xuids": [],
-                "device_ids": [],
-                "device_os": [],
-                "game_versions": [],
-                "locales": [],
-                "unique_ids": [],
-                "first_seen": current_time,
-                "last_seen": current_time
-            }
+        with self._lock:
+            players = self._players
 
-        players[player_name]["last_seen"] = current_time
+            if player_name not in players:
+                players[player_name] = {
+                    "ips": [],
+                    "xuids": [],
+                    "device_ids": [],
+                    "device_os": [],
+                    "game_versions": [],
+                    "locales": [],
+                    "unique_ids": [],
+                    "first_seen": current_time,
+                    "last_seen": current_time
+                }
+                self._name_index[player_name.lower()] = player_name
 
-        current_ips = [entry["ip"] if isinstance(entry, dict) else entry for entry in players[player_name]["ips"]]
-        if ip_address not in current_ips:
-            players[player_name]["ips"].append({"ip": ip_address, "timestamp": current_time})
-            self.logger.info(f"New IP recorded for {player_name}: {ip_address}")
+            players[player_name]["last_seen"] = current_time
 
-        current_xuids = [entry["xuid"] if isinstance(entry, dict) else entry for entry in players[player_name]["xuids"]]
-        if xuid not in current_xuids:
-            players[player_name]["xuids"].append({"xuid": xuid, "timestamp": current_time})
-            self.logger.info(f"New XUID recorded for {player_name}: {xuid}")
+            current_ips = [entry["ip"] if isinstance(entry, dict) else entry for entry in players[player_name]["ips"]]
+            if ip_address not in current_ips:
+                players[player_name]["ips"].append({"ip": ip_address, "timestamp": current_time})
+                self._add_to_subnet_index(player_name, ip_address)
+                self.logger.info(f"New IP recorded for {player_name}: {ip_address}")
 
-        current_device_ids = [entry["device_id"] if isinstance(entry, dict) else entry for entry in
-                              players[player_name]["device_ids"]]
-        if device_id not in current_device_ids:
-            players[player_name]["device_ids"].append({"device_id": device_id, "timestamp": current_time})
-            self.logger.info(f"New Device ID recorded for {player_name}: {device_id}")
+            current_xuids = [entry["xuid"] if isinstance(entry, dict) else entry for entry in players[player_name]["xuids"]]
+            if xuid not in current_xuids:
+                players[player_name]["xuids"].append({"xuid": xuid, "timestamp": current_time})
+                self.logger.info(f"New XUID recorded for {player_name}: {xuid}")
 
-        current_device_os = [entry["device_os"] if isinstance(entry, dict) else entry for entry in
-                             players[player_name]["device_os"]]
-        if device_os not in current_device_os:
-            players[player_name]["device_os"].append({"device_os": device_os, "timestamp": current_time})
-            self.logger.info(f"New Device OS recorded for {player_name}: {device_os}")
+            current_device_ids = [entry["device_id"] if isinstance(entry, dict) else entry for entry in
+                                  players[player_name]["device_ids"]]
+            if device_id not in current_device_ids:
+                players[player_name]["device_ids"].append({"device_id": device_id, "timestamp": current_time})
+                self.logger.info(f"New Device ID recorded for {player_name}: {device_id}")
 
-        current_game_versions = [entry["game_version"] if isinstance(entry, dict) else entry for entry in
-                                 players[player_name]["game_versions"]]
-        if game_version not in current_game_versions:
-            players[player_name]["game_versions"].append({"game_version": game_version, "timestamp": current_time})
-            self.logger.info(f"New Game Version recorded for {player_name}: {game_version}")
+            current_device_os = [entry["device_os"] if isinstance(entry, dict) else entry for entry in
+                                 players[player_name]["device_os"]]
+            if device_os not in current_device_os:
+                players[player_name]["device_os"].append({"device_os": device_os, "timestamp": current_time})
+                self.logger.info(f"New Device OS recorded for {player_name}: {device_os}")
 
-        current_locales = [entry["locale"] if isinstance(entry, dict) else entry for entry in
-                           players[player_name]["locales"]]
-        if locale not in current_locales:
-            players[player_name]["locales"].append({"locale": locale, "timestamp": current_time})
-            self.logger.info(f"New Locale recorded for {player_name}: {locale}")
+            current_game_versions = [entry["game_version"] if isinstance(entry, dict) else entry for entry in
+                                     players[player_name]["game_versions"]]
+            if game_version not in current_game_versions:
+                players[player_name]["game_versions"].append({"game_version": game_version, "timestamp": current_time})
+                self.logger.info(f"New Game Version recorded for {player_name}: {game_version}")
 
-        current_unique_ids = [entry["unique_id"] if isinstance(entry, dict) else entry for entry in
-                              players[player_name]["unique_ids"]]
-        if unique_id not in current_unique_ids:
-            players[player_name]["unique_ids"].append({"unique_id": unique_id, "timestamp": current_time})
-            self.logger.info(f"New Unique ID recorded for {player_name}: {unique_id}")
+            current_locales = [entry["locale"] if isinstance(entry, dict) else entry for entry in
+                               players[player_name]["locales"]]
+            if locale not in current_locales:
+                players[player_name]["locales"].append({"locale": locale, "timestamp": current_time})
+                self.logger.info(f"New Locale recorded for {player_name}: {locale}")
 
-        self.save_players(players)
-        self.update_mappings(player_name, ip_address, xuid, device_id)
+            current_unique_ids = [entry["unique_id"] if isinstance(entry, dict) else entry for entry in
+                                  players[player_name]["unique_ids"]]
+            if unique_id not in current_unique_ids:
+                players[player_name]["unique_ids"].append({"unique_id": unique_id, "timestamp": current_time})
+                self.logger.info(f"New Unique ID recorded for {player_name}: {unique_id}")
+
+            self._update_mappings_locked(player_name, ip_address, xuid, device_id)
+
+            self._players_dirty = True
+            self._mappings_dirty = True
 
     def is_ip_address(self, text: str) -> bool:
         ip_pattern = r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
         return re.match(ip_pattern, text) is not None
 
-    def are_ips_in_same_subnet(self, ip1: str, ip2: str, subnet_mask: int = 24) -> bool:
+    def are_ips_in_same_subnet(self, ip1: str, ip2: str, subnet_mask: int = SUBNET_MASK) -> bool:
         try:
             network1 = ipaddress.IPv4Network(f"{ip1}/{subnet_mask}", strict=False)
             network2 = ipaddress.IPv4Network(f"{ip2}/{subnet_mask}", strict=False)
@@ -301,118 +324,107 @@ class AltDetection(Plugin):
             return False
 
     def find_alts_by_ip(self, ip_address: str) -> dict:
-        mappings = self.load_mappings()
-        players_data = self.load_players()
+        with self._lock:
+            mappings = self._mappings
+            players_data = self._players
 
-        if ip_address not in mappings["ip_to_players"]:
-            return {"found": False, "players": []}
+            if ip_address not in mappings["ip_to_players"]:
+                return {"found": False, "players": []}
 
-        players_with_ip = mappings["ip_to_players"][ip_address]
-        detailed_players = []
+            players_with_ip = list(mappings["ip_to_players"][ip_address])
+            detailed_players = []
 
-        for player_name in players_with_ip:
-            if player_name in players_data:
-                player_info = players_data[player_name]
-                detailed_players.append({
-                    "name": player_name,
-                    "first_seen": player_info.get("first_seen", "Unknown"),
-                    "last_seen": player_info.get("last_seen", "Unknown"),
-                    "total_ips": len(player_info.get("ips", [])),
-                    "total_devices": len(player_info.get("device_ids", [])),
-                    "is_online": self.is_player_online(player_name)
-                })
+            for player_name in players_with_ip:
+                if player_name in players_data:
+                    player_info = players_data[player_name]
+                    detailed_players.append({
+                        "name": player_name,
+                        "first_seen": player_info.get("first_seen", "Unknown"),
+                        "last_seen": player_info.get("last_seen", "Unknown"),
+                        "total_ips": len(player_info.get("ips", [])),
+                        "total_devices": len(player_info.get("device_ids", [])),
+                        "is_online": self.is_player_online(player_name)
+                    })
 
-        return {"found": True, "players": detailed_players}
+            return {"found": True, "players": detailed_players}
 
     def find_alts_by_player(self, player_name: str) -> dict:
-        players_data = self.load_players()
-        mappings = self.load_mappings()
-
         actual_player_name = self.find_player_by_name(player_name)
         if not actual_player_name:
             return {"found": False, "message": f"§cNo data found for player: {player_name}"}
 
-        player_info = players_data[actual_player_name]
-        related_players = set()
+        with self._lock:
+            players_data = self._players
+            mappings = self._mappings
 
-        for ip_entry in player_info.get("ips", []):
-            ip = ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry
-            if ip in mappings["ip_to_players"]:
-                related_players.update(mappings["ip_to_players"][ip])
+            player_info = players_data[actual_player_name]
+            related_players = set()
 
-        for xuid_entry in player_info.get("xuids", []):
-            xuid = xuid_entry["xuid"] if isinstance(xuid_entry, dict) else xuid_entry
-            if xuid in mappings["xuid_to_players"]:
-                related_players.update(mappings["xuid_to_players"][xuid])
+            for ip_entry in player_info.get("ips", []):
+                ip = ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry
+                related_players.update(mappings["ip_to_players"].get(ip, []))
 
-        for device_entry in player_info.get("device_ids", []):
-            device_id = device_entry["device_id"] if isinstance(device_entry, dict) else device_entry
-            if device_id in mappings["device_to_players"]:
-                related_players.update(mappings["device_to_players"][device_id])
+            for xuid_entry in player_info.get("xuids", []):
+                xuid = xuid_entry["xuid"] if isinstance(xuid_entry, dict) else xuid_entry
+                related_players.update(mappings["xuid_to_players"].get(xuid, []))
 
-        subnet_related = set()
-        player_ips = [ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry for ip_entry in
-                      player_info.get("ips", [])]
+            for device_entry in player_info.get("device_ids", []):
+                device_id = device_entry["device_id"] if isinstance(device_entry, dict) else device_entry
+                related_players.update(mappings["device_to_players"].get(device_id, []))
 
-        for other_player, other_info in players_data.items():
-            if other_player == actual_player_name:
-                continue
+            subnet_related = set()
+            for ip_entry in player_info.get("ips", []):
+                ip = ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry
+                network = self._network_key(ip)
+                if network:
+                    subnet_related.update(self._subnet_index.get(network, set()))
 
-            other_ips = [ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry for ip_entry in
-                         other_info.get("ips", [])]
+            related_players.discard(actual_player_name)
+            subnet_related.discard(actual_player_name)
 
-            for player_ip in player_ips:
-                for other_ip in other_ips:
-                    if self.are_ips_in_same_subnet(player_ip, other_ip):
-                        subnet_related.add(other_player)
-                        break
+            detailed_players = []
+            for related_player in related_players:
+                if related_player in players_data:
+                    related_info = players_data[related_player]
+                    detailed_players.append({
+                        "name": related_player,
+                        "first_seen": related_info.get("first_seen", "Unknown"),
+                        "last_seen": related_info.get("last_seen", "Unknown"),
+                        "shared_ips": self.count_shared_ips(player_info, related_info),
+                        "shared_devices": self.count_shared_devices(player_info, related_info),
+                        "connection_type": "direct",
+                        "is_online": self.is_player_online(related_player),
+                        "xuids": related_info.get("xuids", [])
+                    })
 
-        related_players.discard(actual_player_name)
-        subnet_related.discard(actual_player_name)
+            for subnet_player in subnet_related:
+                if subnet_player not in related_players and subnet_player in players_data:
+                    related_info = players_data[subnet_player]
+                    detailed_players.append({
+                        "name": subnet_player,
+                        "first_seen": related_info.get("first_seen", "Unknown"),
+                        "last_seen": related_info.get("last_seen", "Unknown"),
+                        "shared_ips": 0,
+                        "shared_devices": 0,
+                        "connection_type": "subnet",
+                        "is_online": self.is_player_online(subnet_player),
+                        "xuids": related_info.get("xuids", [])
+                    })
 
-        detailed_players = []
-        for related_player in related_players:
-            if related_player in players_data:
-                related_info = players_data[related_player]
-                detailed_players.append({
-                    "name": related_player,
-                    "first_seen": related_info.get("first_seen", "Unknown"),
-                    "last_seen": related_info.get("last_seen", "Unknown"),
-                    "shared_ips": self.count_shared_ips(player_info, related_info),
-                    "shared_devices": self.count_shared_devices(player_info, related_info),
-                    "connection_type": "direct",
-                    "is_online": self.is_player_online(related_player),
-                    "xuids": related_info.get("xuids", [])
-                })
-
-        for subnet_player in subnet_related:
-            if subnet_player not in related_players and subnet_player in players_data:
-                related_info = players_data[subnet_player]
-                detailed_players.append({
-                    "name": subnet_player,
-                    "first_seen": related_info.get("first_seen", "Unknown"),
-                    "last_seen": related_info.get("last_seen", "Unknown"),
-                    "shared_ips": 0,
-                    "shared_devices": 0,
-                    "connection_type": "subnet",
-                    "is_online": self.is_player_online(subnet_player),
-                    "xuids": related_info.get("xuids", [])
-                })
-
-        return {
-            "found": True,
-            "target_player": {
-                "name": actual_player_name,
-                "first_seen": player_info.get("first_seen", "Unknown"),
-                "last_seen": player_info.get("last_seen", "Unknown"),
-                "total_ips": len(player_info.get("ips", [])),
-                "total_devices": len(player_info.get("device_ids", [])),
-                "xuids": player_info.get("xuids", []),
-                "device_os": player_info.get("device_os", []),
-                "is_online": self.is_player_online(actual_player_name)
-            },
-            "related_players": detailed_players
-        }
+            return {
+                "found": True,
+                "target_player": {
+                    "name": actual_player_name,
+                    "first_seen": player_info.get("first_seen", "Unknown"),
+                    "last_seen": player_info.get("last_seen", "Unknown"),
+                    "total_ips": len(player_info.get("ips", [])),
+                    "total_devices": len(player_info.get("device_ids", [])),
+                    "xuids": player_info.get("xuids", []),
+                    "device_os": player_info.get("device_os", []),
+                    "is_online": self.is_player_online(actual_player_name)
+                },
+                "related_players": detailed_players
+            }
 
     def count_shared_ips(self, player1_info: dict, player2_info: dict) -> int:
         player1_ips = {ip["ip"] if isinstance(ip, dict) else ip for ip in player1_info.get("ips", [])}
