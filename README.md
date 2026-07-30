@@ -7,7 +7,6 @@ A simple alternative account detection system for Minecraft Bedrock servers. Tra
 - Detects alt accounts using IP addresses, device IDs, and XUIDs
 - Tracks player login history and device information
 - Real-time notifications to operators when potential alts join
-- Subnet analysis for players on the same network
 - Simple JSON file storage
 
 ## Installation

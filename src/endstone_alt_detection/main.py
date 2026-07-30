@@ -11,7 +11,6 @@ from endstone.event import event_handler, PlayerLoginEvent, PlayerQuitEvent
 from endstone.command import Command, CommandSender
 
 FLUSH_PERIOD_TICKS = 6000
-SUBNET_MASK = 24
 
 
 class AltDetection(Plugin):
@@ -138,25 +137,9 @@ class AltDetection(Plugin):
 
     def build_indexes(self) -> None:
         self._name_index = {}
-        self._subnet_index = {}
 
         for player_name, info in self._players.items():
             self._name_index[player_name.lower()] = player_name
-            for ip_entry in info.get("ips", []):
-                ip = ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry
-                self._add_to_subnet_index(player_name, ip)
-
-    def _network_key(self, ip: str, subnet_mask: int = SUBNET_MASK) -> str:
-        try:
-            return str(ipaddress.IPv4Network(f"{ip}/{subnet_mask}", strict=False).network_address)
-        except Exception:
-            return None
-
-    def _add_to_subnet_index(self, player_name: str, ip: str) -> None:
-        network = self._network_key(ip)
-        if network is None:
-            return
-        self._subnet_index.setdefault(network, set()).add(player_name)
 
     def find_player_by_name(self, search_name: str) -> str:
         return self._name_index.get(search_name.lower())
@@ -344,7 +327,6 @@ class AltDetection(Plugin):
             current_ips = [entry["ip"] if isinstance(entry, dict) else entry for entry in players[player_name]["ips"]]
             if ip_address not in current_ips:
                 players[player_name]["ips"].append({"ip": ip_address, "timestamp": current_time})
-                self._add_to_subnet_index(player_name, ip_address)
                 self.logger.info(f"New IP recorded for {player_name}: {ip_address}")
 
             current_xuids = [entry["xuid"] if isinstance(entry, dict) else entry for entry in players[player_name]["xuids"]]
@@ -390,14 +372,6 @@ class AltDetection(Plugin):
     def is_ip_address(self, text: str) -> bool:
         ip_pattern = r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
         return re.match(ip_pattern, text) is not None
-
-    def are_ips_in_same_subnet(self, ip1: str, ip2: str, subnet_mask: int = SUBNET_MASK) -> bool:
-        try:
-            network1 = ipaddress.IPv4Network(f"{ip1}/{subnet_mask}", strict=False)
-            network2 = ipaddress.IPv4Network(f"{ip2}/{subnet_mask}", strict=False)
-            return network1.network_address == network2.network_address
-        except:
-            return False
 
     def find_alts_by_ip(self, ip_address: str) -> dict:
         with self._lock:
@@ -453,15 +427,7 @@ class AltDetection(Plugin):
                 device_id = device_entry["device_id"] if isinstance(device_entry, dict) else device_entry
                 related_players.update(mappings["device_to_players"].get(device_id, []))
 
-            subnet_related = set()
-            for ip_entry in player_info.get("ips", []):
-                ip = ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry
-                network = self._network_key(ip)
-                if network:
-                    subnet_related.update(self._subnet_index.get(network, set()))
-
             related_players.discard(actual_player_name)
-            subnet_related.discard(actual_player_name)
 
             player_ips = {ip["ip"] if isinstance(ip, dict) else ip for ip in player_info.get("ips", [])}
 
@@ -483,36 +449,6 @@ class AltDetection(Plugin):
                         "is_whitelisted": (
                             related_player.lower() in whitelisted_players
                             or bool(shared_ips & whitelisted_ips)
-                        )
-                    })
-
-            for subnet_player in subnet_related:
-                if subnet_player not in related_players and subnet_player in players_data:
-                    related_info = players_data[subnet_player]
-                    related_ips = {ip["ip"] if isinstance(ip, dict) else ip for ip in related_info.get("ips", [])}
-                    subnet_whitelisted = False
-                    for ip in player_ips:
-                        for related_ip in related_ips:
-                            if self._network_key(ip) == self._network_key(related_ip) and (
-                                ip in whitelisted_ips or related_ip in whitelisted_ips
-                            ):
-                                subnet_whitelisted = True
-                                break
-                        if subnet_whitelisted:
-                            break
-
-                    detailed_players.append({
-                        "name": subnet_player,
-                        "first_seen": related_info.get("first_seen", "Unknown"),
-                        "last_seen": related_info.get("last_seen", "Unknown"),
-                        "shared_ips": 0,
-                        "shared_devices": 0,
-                        "connection_type": "subnet",
-                        "is_online": self.is_player_online(subnet_player),
-                        "xuids": related_info.get("xuids", []),
-                        "is_whitelisted": (
-                            subnet_player.lower() in whitelisted_players
-                            or subnet_whitelisted
                         )
                     })
 
@@ -695,7 +631,6 @@ class AltDetection(Plugin):
             return
 
         direct_matches = [alt for alt in related if alt.get("connection_type") == "direct"]
-        subnet_matches = [alt for alt in related if alt.get("connection_type") == "subnet"]
 
         if direct_matches:
             direct_count = len(direct_matches)
@@ -707,30 +642,6 @@ class AltDetection(Plugin):
                 alt_label = f"{alt['name']} §7(Whitelisted)" if alt.get("is_whitelisted") else alt['name']
                 sender.send_message(
                     f"§h- §e{alt_label} §h(Shared IPs: {alt['shared_ips']}, Shared Devices: {alt['shared_devices']})")
-                sender.send_message(f"  {online_status}")
-                sender.send_message(f"  §eFirst login: §h{self.format_time_ago(alt['first_seen'])}")
-                sender.send_message(f"  §aLast login: §h{self.format_time_ago(alt['last_seen'])}")
-
-                if alt['xuids']:
-                    xuid_display = alt['xuids'][0]["xuid"] if isinstance(alt['xuids'][0], dict) else alt['xuids'][0]
-                    sender.send_message(f"  §9XUID: §h{xuid_display}")
-
-                if alt['is_online']:
-                    online_info = self.get_online_player_info(alt['name'])
-                    if online_info:
-                        sender.send_message(f"  §cCurrent Device OS: §h{online_info['device_os']}")
-                        sender.send_message(f" ")
-
-        if subnet_matches:
-            subnet_count = len(subnet_matches)
-            account_word = "account" if subnet_count == 1 else "accounts"
-
-            sender.send_message(f" ")
-            sender.send_message(f"§aFound {subnet_count} possible alt {account_word} on same network:")
-            for alt in subnet_matches:
-                online_status = "§aStatus: §hOnline" if alt['is_online'] else "§cStatus: §hOffline"
-                alt_label = f"{alt['name']} §7(Whitelisted)" if alt.get("is_whitelisted") else alt['name']
-                sender.send_message(f"§h- §e{alt_label} §h(Same subnet)")
                 sender.send_message(f"  {online_status}")
                 sender.send_message(f"  §eFirst login: §h{self.format_time_ago(alt['first_seen'])}")
                 sender.send_message(f"  §aLast login: §h{self.format_time_ago(alt['last_seen'])}")
