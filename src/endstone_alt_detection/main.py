@@ -422,7 +422,7 @@ class AltDetection(Plugin):
                         "total_ips": len(player_info.get("ips", [])),
                         "total_devices": len(player_info.get("device_ids", [])),
                         "is_online": self.is_player_online(player_name),
-                        "is_whitelisted": player_name.lower() in whitelisted_players
+                        "is_whitelisted": ip_whitelisted or player_name.lower() in whitelisted_players
                     })
 
             return {"found": True, "players": detailed_players, "ip_whitelisted": ip_whitelisted}
@@ -463,25 +463,44 @@ class AltDetection(Plugin):
             related_players.discard(actual_player_name)
             subnet_related.discard(actual_player_name)
 
+            player_ips = {ip["ip"] if isinstance(ip, dict) else ip for ip in player_info.get("ips", [])}
+
             detailed_players = []
             for related_player in related_players:
                 if related_player in players_data:
                     related_info = players_data[related_player]
+                    related_ips = {ip["ip"] if isinstance(ip, dict) else ip for ip in related_info.get("ips", [])}
+                    shared_ips = player_ips & related_ips
                     detailed_players.append({
                         "name": related_player,
                         "first_seen": related_info.get("first_seen", "Unknown"),
                         "last_seen": related_info.get("last_seen", "Unknown"),
-                        "shared_ips": self.count_shared_ips(player_info, related_info),
+                        "shared_ips": len(shared_ips),
                         "shared_devices": self.count_shared_devices(player_info, related_info),
                         "connection_type": "direct",
                         "is_online": self.is_player_online(related_player),
                         "xuids": related_info.get("xuids", []),
-                        "is_whitelisted": related_player.lower() in whitelisted_players
+                        "is_whitelisted": (
+                            related_player.lower() in whitelisted_players
+                            or bool(shared_ips & whitelisted_ips)
+                        )
                     })
 
             for subnet_player in subnet_related:
                 if subnet_player not in related_players and subnet_player in players_data:
                     related_info = players_data[subnet_player]
+                    related_ips = {ip["ip"] if isinstance(ip, dict) else ip for ip in related_info.get("ips", [])}
+                    subnet_whitelisted = False
+                    for ip in player_ips:
+                        for related_ip in related_ips:
+                            if self._network_key(ip) == self._network_key(related_ip) and (
+                                ip in whitelisted_ips or related_ip in whitelisted_ips
+                            ):
+                                subnet_whitelisted = True
+                                break
+                        if subnet_whitelisted:
+                            break
+
                     detailed_players.append({
                         "name": subnet_player,
                         "first_seen": related_info.get("first_seen", "Unknown"),
@@ -491,7 +510,10 @@ class AltDetection(Plugin):
                         "connection_type": "subnet",
                         "is_online": self.is_player_online(subnet_player),
                         "xuids": related_info.get("xuids", []),
-                        "is_whitelisted": subnet_player.lower() in whitelisted_players
+                        "is_whitelisted": (
+                            subnet_player.lower() in whitelisted_players
+                            or subnet_whitelisted
+                        )
                     })
 
             return {
