@@ -284,7 +284,10 @@ class AltDetection(Plugin):
             return {"is_alt": False, "related_count": 0}
 
         related_players = result["related_players"]
-        direct_matches = [alt for alt in related_players if alt.get("connection_type") == "direct"]
+        direct_matches = [
+            alt for alt in related_players
+            if alt.get("connection_type") == "direct" and not alt.get("is_whitelisted")
+        ]
 
         return {
             "is_alt": len(direct_matches) > 0,
@@ -401,19 +404,15 @@ class AltDetection(Plugin):
             mappings = self._mappings
             players_data = self._players
             whitelisted_players = {name.lower() for name in self._whitelist["players"]}
-
-            if ip_address in self._whitelist["ips"]:
-                return {"found": False, "players": []}
+            ip_whitelisted = ip_address in self._whitelist["ips"]
 
             if ip_address not in mappings["ip_to_players"]:
-                return {"found": False, "players": []}
+                return {"found": False, "players": [], "ip_whitelisted": ip_whitelisted}
 
             players_with_ip = list(mappings["ip_to_players"][ip_address])
             detailed_players = []
 
             for player_name in players_with_ip:
-                if player_name.lower() in whitelisted_players:
-                    continue
                 if player_name in players_data:
                     player_info = players_data[player_name]
                     detailed_players.append({
@@ -422,10 +421,11 @@ class AltDetection(Plugin):
                         "last_seen": player_info.get("last_seen", "Unknown"),
                         "total_ips": len(player_info.get("ips", [])),
                         "total_devices": len(player_info.get("device_ids", [])),
-                        "is_online": self.is_player_online(player_name)
+                        "is_online": self.is_player_online(player_name),
+                        "is_whitelisted": player_name.lower() in whitelisted_players
                     })
 
-            return {"found": True, "players": detailed_players}
+            return {"found": True, "players": detailed_players, "ip_whitelisted": ip_whitelisted}
 
     def find_alts_by_player(self, player_name: str) -> dict:
         actual_player_name = self.find_player_by_name(player_name)
@@ -443,8 +443,6 @@ class AltDetection(Plugin):
 
             for ip_entry in player_info.get("ips", []):
                 ip = ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry
-                if ip in whitelisted_ips:
-                    continue
                 related_players.update(mappings["ip_to_players"].get(ip, []))
 
             for xuid_entry in player_info.get("xuids", []):
@@ -458,16 +456,12 @@ class AltDetection(Plugin):
             subnet_related = set()
             for ip_entry in player_info.get("ips", []):
                 ip = ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry
-                if ip in whitelisted_ips:
-                    continue
                 network = self._network_key(ip)
                 if network:
                     subnet_related.update(self._subnet_index.get(network, set()))
 
             related_players.discard(actual_player_name)
             subnet_related.discard(actual_player_name)
-            related_players = {name for name in related_players if name.lower() not in whitelisted_players}
-            subnet_related = {name for name in subnet_related if name.lower() not in whitelisted_players}
 
             detailed_players = []
             for related_player in related_players:
@@ -481,7 +475,8 @@ class AltDetection(Plugin):
                         "shared_devices": self.count_shared_devices(player_info, related_info),
                         "connection_type": "direct",
                         "is_online": self.is_player_online(related_player),
-                        "xuids": related_info.get("xuids", [])
+                        "xuids": related_info.get("xuids", []),
+                        "is_whitelisted": related_player.lower() in whitelisted_players
                     })
 
             for subnet_player in subnet_related:
@@ -495,7 +490,8 @@ class AltDetection(Plugin):
                         "shared_devices": 0,
                         "connection_type": "subnet",
                         "is_online": self.is_player_online(subnet_player),
-                        "xuids": related_info.get("xuids", [])
+                        "xuids": related_info.get("xuids", []),
+                        "is_whitelisted": subnet_player.lower() in whitelisted_players
                     })
 
             return {
@@ -508,7 +504,8 @@ class AltDetection(Plugin):
                     "total_devices": len(player_info.get("device_ids", [])),
                     "xuids": player_info.get("xuids", []),
                     "device_os": player_info.get("device_os", []),
-                    "is_online": self.is_player_online(actual_player_name)
+                    "is_online": self.is_player_online(actual_player_name),
+                    "is_whitelisted": actual_player_name.lower() in whitelisted_players
                 },
                 "related_players": detailed_players
             }
@@ -624,14 +621,16 @@ class AltDetection(Plugin):
 
         player_count = len(result['players'])
         player_word = "player" if player_count == 1 else "players"
+        ip_label = f"{ip_address} §7(Whitelisted)" if result.get("ip_whitelisted") else ip_address
         sender.send_message(f" ")
-        sender.send_message(f"§b--- Alt Check Results for {ip_address} ---")
+        sender.send_message(f"§b--- Alt Check Results for {ip_label} ---")
         sender.send_message(f"§aFound {player_count} {player_word} using this IP:")
 
         for player in result["players"]:
             online_status = "§aStatus: §hOnline" if player['is_online'] else "§cStatus: §hOffline"
+            name_label = f"{player['name']} §7(Whitelisted)" if player.get("is_whitelisted") else player['name']
             sender.send_message(
-                f"§h- §e{player['name']} §h(IPs: {player['total_ips']}, Devices: {player['total_devices']})")
+                f"§h- §e{name_label} §h(IPs: {player['total_ips']}, Devices: {player['total_devices']})")
             sender.send_message(f"  {online_status}")
             sender.send_message(f"  §eFirst login: §h{self.format_time_ago(player['first_seen'])}")
             sender.send_message(f"  §aLast login: §h{self.format_time_ago(player['last_seen'])}")
@@ -647,8 +646,9 @@ class AltDetection(Plugin):
         target = result["target_player"]
         related = result["related_players"]
 
+        target_label = f"{target['name']} §7(Whitelisted)" if target.get("is_whitelisted") else target['name']
         sender.send_message(f" ")
-        sender.send_message(f"§a--- Alt Check Results for {target['name']} ---")
+        sender.send_message(f"§a--- Alt Check Results for {target_label} ---")
         online_status = "§aStatus: §hOnline" if target['is_online'] else "§cStatus: §hOffline"
         sender.send_message(f"{online_status}")
         sender.send_message(f"§eFirst login: §h{self.format_time_ago(target['first_seen'])}")
@@ -682,8 +682,9 @@ class AltDetection(Plugin):
             sender.send_message(f"§aFound {direct_count} {account_word} with matching IPs:")
             for alt in direct_matches:
                 online_status = "§aStatus: §hOnline" if alt['is_online'] else "§cStatus: §hOffline"
+                alt_label = f"{alt['name']} §7(Whitelisted)" if alt.get("is_whitelisted") else alt['name']
                 sender.send_message(
-                    f"§h- §e{alt['name']} §h(Shared IPs: {alt['shared_ips']}, Shared Devices: {alt['shared_devices']})")
+                    f"§h- §e{alt_label} §h(Shared IPs: {alt['shared_ips']}, Shared Devices: {alt['shared_devices']})")
                 sender.send_message(f"  {online_status}")
                 sender.send_message(f"  §eFirst login: §h{self.format_time_ago(alt['first_seen'])}")
                 sender.send_message(f"  §aLast login: §h{self.format_time_ago(alt['last_seen'])}")
@@ -706,7 +707,8 @@ class AltDetection(Plugin):
             sender.send_message(f"§aFound {subnet_count} possible alt {account_word} on same network:")
             for alt in subnet_matches:
                 online_status = "§aStatus: §hOnline" if alt['is_online'] else "§cStatus: §hOffline"
-                sender.send_message(f"§h- §e{alt['name']} §h(Same subnet)")
+                alt_label = f"{alt['name']} §7(Whitelisted)" if alt.get("is_whitelisted") else alt['name']
+                sender.send_message(f"§h- §e{alt_label} §h(Same subnet)")
                 sender.send_message(f"  {online_status}")
                 sender.send_message(f"  §eFirst login: §h{self.format_time_ago(alt['first_seen'])}")
                 sender.send_message(f"  §aLast login: §h{self.format_time_ago(alt['last_seen'])}")
