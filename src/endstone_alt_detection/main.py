@@ -21,12 +21,21 @@ class AltDetection(Plugin):
             "description": "Check for alternative accounts",
             "usages": ["/alt-check <target: str>"],
             "permissions": ["altdetection.use"],
+        },
+        "alt-whitelist": {
+            "description": "Manage the alt detection whitelist",
+            "usages": ["/alt-whitelist <add|remove|list> [target: str]"],
+            "permissions": ["altdetection.whitelist"],
         }
     }
 
     permissions = {
         "altdetection.use": {
             "description": "Allow users to use the alt-check command.",
+            "default": "op",
+        },
+        "altdetection.whitelist": {
+            "description": "Allow users to manage the alt detection whitelist.",
             "default": "op",
         }
     }
@@ -39,6 +48,7 @@ class AltDetection(Plugin):
         self._lock = threading.Lock()
         self._players_dirty = False
         self._mappings_dirty = False
+        self._whitelist_dirty = False
         self.setup_database()
         self.load_cache()
         self.build_indexes()
@@ -57,6 +67,7 @@ class AltDetection(Plugin):
 
         self.players_file = self.db_dir / "players.json"
         self.mappings_file = self.db_dir / "mappings.json"
+        self.whitelist_file = self.db_dir / "whitelist.json"
 
         if not self.players_file.exists():
             self._atomic_write(self.players_file, {})
@@ -71,6 +82,14 @@ class AltDetection(Plugin):
             self._atomic_write(self.mappings_file, initial_mappings)
             self.logger.info("Created mappings.json file")
 
+        if not self.whitelist_file.exists():
+            initial_whitelist = {
+                "players": [],
+                "ips": []
+            }
+            self._atomic_write(self.whitelist_file, initial_whitelist)
+            self.logger.info("Created whitelist.json file")
+
     def load_cache(self) -> None:
         self._players = self._read_json(self.players_file, {})
 
@@ -79,6 +98,11 @@ class AltDetection(Plugin):
         mappings.setdefault("xuid_to_players", {})
         mappings.setdefault("device_to_players", {})
         self._mappings = mappings
+
+        whitelist = self._read_json(self.whitelist_file, {})
+        whitelist.setdefault("players", [])
+        whitelist.setdefault("ips", [])
+        self._whitelist = whitelist
 
     def _read_json(self, path: Path, default: dict) -> dict:
         try:
@@ -108,6 +132,9 @@ class AltDetection(Plugin):
             if self._mappings_dirty:
                 self._atomic_write(self.mappings_file, self._mappings)
                 self._mappings_dirty = False
+            if self._whitelist_dirty:
+                self._atomic_write(self.whitelist_file, self._whitelist)
+                self._whitelist_dirty = False
 
     def build_indexes(self) -> None:
         self._name_index = {}
@@ -133,6 +160,49 @@ class AltDetection(Plugin):
 
     def find_player_by_name(self, search_name: str) -> str:
         return self._name_index.get(search_name.lower())
+
+    def is_player_whitelisted(self, player_name: str) -> bool:
+        with self._lock:
+            return player_name.lower() in {name.lower() for name in self._whitelist["players"]}
+
+    def is_ip_whitelisted(self, ip_address: str) -> bool:
+        with self._lock:
+            return ip_address in self._whitelist["ips"]
+
+    def add_to_whitelist(self, kind: str, value: str) -> bool:
+        with self._lock:
+            bucket = self._whitelist[kind]
+            if kind == "players":
+                if value.lower() in {name.lower() for name in bucket}:
+                    return False
+            elif value in bucket:
+                return False
+
+            bucket.append(value)
+            self._whitelist_dirty = True
+            return True
+
+    def remove_from_whitelist(self, kind: str, value: str) -> bool:
+        with self._lock:
+            bucket = self._whitelist[kind]
+            if kind == "players":
+                match = next((name for name in bucket if name.lower() == value.lower()), None)
+            else:
+                match = value if value in bucket else None
+
+            if match is None:
+                return False
+
+            bucket.remove(match)
+            self._whitelist_dirty = True
+            return True
+
+    def get_whitelist(self) -> dict:
+        with self._lock:
+            return {
+                "players": list(self._whitelist["players"]),
+                "ips": list(self._whitelist["ips"])
+            }
 
     def format_time_ago(self, timestamp_str: str) -> str:
         try:
@@ -205,6 +275,9 @@ class AltDetection(Plugin):
                 self.logger.error(f"Failed to send toast to operator {operator.name}: {e}")
 
     def check_for_alt_on_join(self, player_name: str) -> dict:
+        if self.is_player_whitelisted(player_name):
+            return {"is_alt": False, "related_count": 0}
+
         result = self.find_alts_by_player(player_name)
 
         if not result["found"]:
@@ -327,6 +400,10 @@ class AltDetection(Plugin):
         with self._lock:
             mappings = self._mappings
             players_data = self._players
+            whitelisted_players = {name.lower() for name in self._whitelist["players"]}
+
+            if ip_address in self._whitelist["ips"]:
+                return {"found": False, "players": []}
 
             if ip_address not in mappings["ip_to_players"]:
                 return {"found": False, "players": []}
@@ -335,6 +412,8 @@ class AltDetection(Plugin):
             detailed_players = []
 
             for player_name in players_with_ip:
+                if player_name.lower() in whitelisted_players:
+                    continue
                 if player_name in players_data:
                     player_info = players_data[player_name]
                     detailed_players.append({
@@ -356,12 +435,16 @@ class AltDetection(Plugin):
         with self._lock:
             players_data = self._players
             mappings = self._mappings
+            whitelisted_players = {name.lower() for name in self._whitelist["players"]}
+            whitelisted_ips = set(self._whitelist["ips"])
 
             player_info = players_data[actual_player_name]
             related_players = set()
 
             for ip_entry in player_info.get("ips", []):
                 ip = ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry
+                if ip in whitelisted_ips:
+                    continue
                 related_players.update(mappings["ip_to_players"].get(ip, []))
 
             for xuid_entry in player_info.get("xuids", []):
@@ -375,12 +458,16 @@ class AltDetection(Plugin):
             subnet_related = set()
             for ip_entry in player_info.get("ips", []):
                 ip = ip_entry["ip"] if isinstance(ip_entry, dict) else ip_entry
+                if ip in whitelisted_ips:
+                    continue
                 network = self._network_key(ip)
                 if network:
                     subnet_related.update(self._subnet_index.get(network, set()))
 
             related_players.discard(actual_player_name)
             subnet_related.discard(actual_player_name)
+            related_players = {name for name in related_players if name.lower() not in whitelisted_players}
+            subnet_related = {name for name in subnet_related if name.lower() not in whitelisted_players}
 
             detailed_players = []
             for related_player in related_players:
@@ -441,7 +528,66 @@ class AltDetection(Plugin):
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
         if command.name == "alt-check":
             return self.handle_alt_check_command(sender, args)
+        if command.name == "alt-whitelist":
+            return self.handle_alt_whitelist_command(sender, args)
         return False
+
+    def handle_alt_whitelist_command(self, sender: CommandSender, args: list[str]) -> bool:
+        if len(args) == 0:
+            sender.send_error_message("Usage: /alt-whitelist <add|remove|list> [player_name_or_ip]")
+            return False
+
+        subcommand = args[0].lower()
+
+        if subcommand == "list":
+            whitelist = self.get_whitelist()
+            sender.send_message(f" ")
+            sender.send_message("§b--- Alt Detection Whitelist ---")
+
+            if whitelist["players"]:
+                sender.send_message(f"§aWhitelisted players ({len(whitelist['players'])}):")
+                for player_name in whitelist["players"]:
+                    sender.send_message(f"  §h- §e{player_name}")
+            else:
+                sender.send_message("§7No whitelisted players.")
+
+            if whitelist["ips"]:
+                sender.send_message(f"§aWhitelisted IPs ({len(whitelist['ips'])}):")
+                for ip_address in whitelist["ips"]:
+                    sender.send_message(f"  §h- §e{ip_address}")
+            else:
+                sender.send_message("§7No whitelisted IPs.")
+
+            return True
+
+        if subcommand not in ("add", "remove"):
+            sender.send_error_message("Usage: /alt-whitelist <add|remove|list> [player_name_or_ip]")
+            return False
+
+        if len(args) < 2:
+            sender.send_error_message(f"Usage: /alt-whitelist {subcommand} <player_name_or_ip>")
+            return False
+
+        target = " ".join(args[1:])
+        if target.startswith('"') and target.endswith('"'):
+            target = target[1:-1]
+        elif target.startswith("'") and target.endswith("'"):
+            target = target[1:-1]
+
+        kind = "ips" if self.is_ip_address(target) else "players"
+
+        if subcommand == "add":
+            if self.add_to_whitelist(kind, target):
+                sender.send_message(f"§aAdded {target} to the alt detection whitelist.")
+            else:
+                sender.send_message(f"§e{target} is already on the alt detection whitelist.")
+        else:
+            if self.remove_from_whitelist(kind, target):
+                sender.send_message(f"§aRemoved {target} from the alt detection whitelist.")
+            else:
+                sender.send_message(f"§e{target} was not found on the alt detection whitelist.")
+
+        return True
 
     def handle_alt_check_command(self, sender: CommandSender, args: list[str]) -> bool:
         if len(args) == 0:
