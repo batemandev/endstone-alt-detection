@@ -29,7 +29,7 @@ Check for alt accounts by player name or IP address.
 **Permission:** `altdetection.use` (default: op)
 
 ### `/alt-whitelist <add|remove|list> [player_name_or_ip]`
-Manage the alt detection whitelist. Whitelisted players and IPs are fully exempt from alt matching — no join alerts and they're excluded from `/alt-check` results. Works from both the console and in-game. Entries can also be edited directly in `alt-detection/whitelist.json`.
+Manage the alt detection whitelist. Whitelisted players and IPs no longer trigger join alerts, but they still show up in `/alt-check` results tagged `(Whitelisted)`. Works from both the console and in-game. Entries can also be edited directly in `alt-detection/whitelist.json`.
 
 ```
 /alt-whitelist add PlayerName
